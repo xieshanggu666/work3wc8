@@ -6,7 +6,9 @@
 // 同时冗余产生该段用电时的设备名 / 房间名快照与完整 ISO 起止时间：
 // 改名、换房只影响之后的段，历史始终归属产生它的名字与房间。
 
-import { round4, HOUR_MS, splitByHour, kwhInWindow, forEachHourSlice, dayKey } from './prorate.js'
+import {
+  round4, HOUR_MS, splitByHour, kwhInWindow, wattsInWindow, forEachHourSlice, dayKey
+} from './prorate.js'
 
 const SEG_TICK_MS = 30_000          // 模拟设备运行：每 30s 结段并续开，用电持续落库
 const KEEP_MS = 7 * 24 * 3600_000   // 分段明细保留 7 天
@@ -381,6 +383,7 @@ export function getSummary(at = new Date()) {
   // 相交条件：start_time < 窗口终点；end_time <= 窗口起点的由分摊函数自然返回 0
   const rows = db.prepare('SELECT * FROM energy_records WHERE start_time < ? ORDER BY end_time')
     .all(new Date(wEnd).toISOString())
+  const liveSegs = db.prepare('SELECT * FROM energy_segments').all()
 
   // 24 个小时桶直接对齐 24h 窗口起点（而非当前整点）：桶与窗口同宽、连续铺满，
   // 桶和严格等于窗口总量，窗口边缘不会出现无桶可归的时段；标签取桶起点的钟点
@@ -401,12 +404,7 @@ export function getSummary(at = new Date()) {
       .map((d) => [d.id, d]))
   let total = 0
 
-  for (const r of rows) {
-    const rStart = new Date(r.start_time).getTime()
-    const rEnd = new Date(r.end_time).getTime()
-    // 整条记录落在 24h 窗口内的部分
-    const rv = kwhInWindow(r.kwh, rStart, rEnd, wStart, wEnd)
-    if (rv <= 0) continue
+  const addUsage = (r, rStart, rEnd, rv, isLive = false) => {
     total += rv
     rooms.set(r.room, (rooms.get(r.room) || 0) + rv)
 
@@ -434,12 +432,37 @@ export function getSummary(at = new Date()) {
     forEachHourSlice(rStart, rEnd, wStart, wEnd, (s, e) => {
       const bi = bucketOf(s)
       if (bi < 0) return
-      const partKwh = r.kwh * ((e - s) / (rEnd - rStart))
+      // 已结记录按已有 kWh 的时间比例分摊；未结段用恒定功率实时折算
+      const partKwh = isLive
+        ? wattsInWindow(r.watts, rStart, rEnd, s, e)
+        : r.kwh * ((e - s) / (rEnd - rStart))
       g.buckets.set(bi, (g.buckets.get(bi) || 0) + partKwh)
       trend[bi].v += partKwh
     })
     // 设备已删除：用时间最新的历史快照作为它的名字/房间
-    if (g.deleted && r.end_time > g.lastEnd) { g.lastEnd = r.end_time; g.name = r.device_name; g.room = r.room }
+    if (g.deleted && rEnd > new Date(g.lastEnd).getTime()) {
+      g.lastEnd = new Date(rEnd).toISOString()
+      g.name = r.device_name
+      g.room = r.room
+    }
+  }
+
+  for (const r of rows) {
+    const rStart = new Date(r.start_time).getTime()
+    const rEnd = new Date(r.end_time).getTime()
+    // 整条记录落在 24h 窗口内的部分
+    const rv = kwhInWindow(r.kwh, rStart, rEnd, wStart, wEnd)
+    if (rv <= 0) continue
+    addUsage(r, rStart, rEnd, rv, false)
+  }
+
+  // 未结运行段实时折算到当前时刻：批量场景刚开启设备时，下一次 /api/state 即可看到
+  // 用量增长；与定额统计保持同一口径，避免能耗页和定额页短时不一致。
+  for (const s of liveSegs) {
+    const segStart = new Date(s.start_time).getTime()
+    const rv = wattsInWindow(s.watts, segStart, wEnd, wStart, wEnd)
+    if (rv <= 0) continue
+    addUsage({ ...s, end_time: at.toISOString() }, segStart, wEnd, rv, true)
   }
 
   const devices = [...groups.values()].map((g) => {

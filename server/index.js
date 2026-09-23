@@ -138,8 +138,11 @@ app.post('/api/device/:id/update', (req, res) => {
   // 改名后同步场景动作里的名称快照（关联仍按 device_id，不受影响）
   if (nextName !== d.name) run('UPDATE scene_actions SET device_key=? WHERE device_id=?', nextName, d.id)
   // 功率/开关变化、改名、换房都构成分段边界：旧段按旧快照结落，新段用新快照记账
-  if (nextName !== d.name || nextRoom !== d.room_id || nextWatts !== d.watts || nextOn !== d.power_on)
+  if (nextName !== d.name || nextRoom !== d.room_id || nextWatts !== d.watts || nextOn !== d.power_on) {
     reconcileDevice(d.id)
+    // 与单设备开关一致：结段后立刻校准定额用量和告警，不能等 30s 节拍
+    evaluateAll()
+  }
   const detail = []
   if (nextName !== d.name) detail.push(`改名「${d.name}」→「${nextName}」`)
   if (nextRoom !== d.room_id) detail.push(`换到 ${q1('SELECT name FROM rooms WHERE id=?', nextRoom).name}`)
@@ -186,6 +189,8 @@ app.post('/api/scene/:id/run', (req, res) => {
                      FROM scene_actions sa LEFT JOIN devices d ON d.id=sa.device_id
                      WHERE sa.scene_id=? ORDER BY sa.order_no, sa.id`, s.id)
   const executed = [], failed = []
+  const changed = new Set()
+  const batchAt = new Date()
   for (const a of actions) {
     const label = a.dname || a.device_key || `设备#${a.device_id ?? '?'}`
     if (!a.did) {
@@ -204,10 +209,14 @@ app.post('/api/scene/:id/run', (req, res) => {
     // 每个动作确定性地映射为开/关：关闭/关机/撤防→关，其余（开启/启动/布防/制冷/调光…）→开
     const on = /关|撤防/.test(a.action) ? 0 : 1
     run('UPDATE devices SET power_on=? WHERE id=?', on, a.did)
-    reconcileDevice(a.did)
+    reconcileDevice(a.did, batchAt)
+    changed.add(a.did)
     log(a.dname, `场景「${s.name}」执行`, a.action)
     executed.push({ device: a.dname, action: a.action })
   }
+  // 批量动作全部结段后统一评估一次：紧接着读取 /api/state 时定额用量与告警状态已是最新。
+  // changed 仅用于标记本批确有设备状态被写入；评估本身全量执行，避免房间定额漏掉联动设备。
+  if (changed.size) evaluateAll(batchAt)
   res.json({ ok: failed.length === 0, executed, failed })
 })
 
