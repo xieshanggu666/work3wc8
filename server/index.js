@@ -138,8 +138,11 @@ app.post('/api/device/:id/update', (req, res) => {
   // 改名后同步场景动作里的名称快照（关联仍按 device_id，不受影响）
   if (nextName !== d.name) run('UPDATE scene_actions SET device_key=? WHERE device_id=?', nextName, d.id)
   // 功率/开关变化、改名、换房都构成分段边界：旧段按旧快照结落，新段用新快照记账
-  if (nextName !== d.name || nextRoom !== d.room_id || nextWatts !== d.watts || nextOn !== d.power_on)
+  if (nextName !== d.name || nextRoom !== d.room_id || nextWatts !== d.watts || nextOn !== d.power_on) {
     reconcileDevice(d.id)
+    // 用电归属/功率/开关已变：立即重估定额，告警读数与状态不等 30s 节拍
+    evaluateAll()
+  }
   const detail = []
   if (nextName !== d.name) detail.push(`改名「${d.name}」→「${nextName}」`)
   if (nextRoom !== d.room_id) detail.push(`换到 ${q1('SELECT name FROM rooms WHERE id=?', nextRoom).name}`)
@@ -208,6 +211,9 @@ app.post('/api/scene/:id/run', (req, res) => {
     log(a.dname, `场景「${s.name}」执行`, a.action)
     executed.push({ device: a.dname, action: a.action })
   }
+  // 场景批量开关与单设备开关同口径：分段已在循环内逐台结落，
+  // 这里统一立即重估定额，告警读数/状态不滞后到下一个 30s 节拍
+  if (executed.length) evaluateAll()
   res.json({ ok: failed.length === 0, executed, failed })
 })
 
